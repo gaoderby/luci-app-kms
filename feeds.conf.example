@@ -1,0 +1,2 @@
+# KMS Feed 配置示例
+src-git kms https://github.com/gaoderby/luci-app-kms.git
