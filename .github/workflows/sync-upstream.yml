@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write  # 允许推送代码
+      actions: write   # 允许管理 Actions 运行记录（清理需要）
     
     steps:
     - name: Checkout repository
@@ -72,3 +73,57 @@ jobs:
         SYNC_TAG="sync-$(date +'%Y%m%d-%H%M%S')"
         git tag -a "$SYNC_TAG" -m "自动同步点: $SYNC_TAG"
         git push origin "$SYNC_TAG"
+
+    # ========== 新增：自动清理旧的工作流记录（保留最近6次） ==========
+    - name: Clean up old workflow runs (keep latest 6)
+      run: |
+        # 安装 GitHub CLI
+        if ! command -v gh &> /dev/null; then
+          echo "Installing GitHub CLI..."
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install -y gh
+        fi
+        
+        # 通过 GITHUB_TOKEN 认证
+        echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+        
+        # 获取当前工作流的名称
+        WORKFLOW_NAME="${{ github.workflow }}"
+        REPO="${{ github.repository }}"
+        KEEP_COUNT=6
+        
+        echo "📊 当前工作流: $WORKFLOW_NAME"
+        echo "📂 仓库: $REPO"
+        echo "📌 保留最近 $KEEP_COUNT 条记录"
+        
+        # 获取所有运行记录（按创建时间倒序），跳过前 KEEP_COUNT 条，删除其余的
+        # 使用 jq 解析 JSON，并排除当前正在运行的 run（通过 ID 过滤）
+        CURRENT_RUN_ID="${{ github.run_id }}"
+        
+        echo "🔍 获取运行记录列表..."
+        RUNS_JSON=$(gh api repos/$REPO/actions/runs --paginate -q ".workflow_runs[] | select(.name == \"$WORKFLOW_NAME\") | {id: .id, created_at: .created_at, status: .status}" | jq -s 'sort_by(.created_at) | reverse')
+        
+        # 获取需要删除的 run IDs（排除当前正在运行的）
+        DELETABLE_IDS=$(echo "$RUNS_JSON" | jq -r ".[$KEEP_COUNT:] | .[] | select(.id != $CURRENT_RUN_ID) | .id")
+        
+        if [ -z "$DELETABLE_IDS" ]; then
+          echo "✅ 没有需要清理的记录（当前总记录数 ≤ $KEEP_COUNT）"
+        else
+          DELETABLE_COUNT=$(echo "$DELETABLE_IDS" | wc -l)
+          echo "🗑️ 发现 $DELETABLE_COUNT 条旧记录需要清理"
+          
+          for RUN_ID in $DELETABLE_IDS; do
+            echo "  删除运行记录 #$RUN_ID"
+            gh api -X DELETE repos/$REPO/actions/runs/$RUN_ID
+            # 添加短暂延迟避免 API 限流
+            sleep 0.5
+          done
+          
+          echo "✅ 清理完成，已删除 $DELETABLE_COUNT 条旧记录"
+        fi
+        
+        # 显示清理后的记录数量
+        REMAINING_COUNT=$(gh api repos/$REPO/actions/runs --paginate -q ".workflow_runs[] | select(.name == \"$WORKFLOW_NAME\") | .id" | wc -l)
+        echo "📊 当前工作流 '$WORKFLOW_NAME' 剩余记录数: $REMAINING_COUNT"
